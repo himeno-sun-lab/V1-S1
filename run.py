@@ -1,0 +1,464 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+##
+## run.py
+##
+## This script implements a unified mechanism to launch computations locally, on Sango cluster, and on K cluster.
+## 
+## Operations performed:
+## 1. build custom parameterizations from commandline arguments
+## 2. initialize a standalone directory per experiment to start, each containing a different 'modelParams.py'
+## 3. launch the runs locally, on Sango, or on K clusters
+
+# commandline argument parsing
+import argparse
+import sys
+
+# guessing the number of cpu (for local execution)
+import multiprocessing
+
+# git misc info
+import subprocess
+import string
+
+# load base and custom parameterizations
+from runpy import run_path
+import importlib
+import numpy as np
+
+# write run parameterization
+import json
+import os.path
+
+#import shlex
+import os
+import datetime
+
+
+class JobDispatcher:
+
+  def __init__(self, cmd_args):
+    # In addition to the commandline arguments, the JobDispatcher object
+    # contains timing info and the git status of the repository
+    self.timeString = str(datetime.datetime.now()).replace('-','_').replace(' ','_').replace(':','_')[:-7]
+    self.cmd_args = cmd_args
+    self.command = 'python'+cmd_args.python
+    self.platform = cmd_args.platform
+    self.storeGDF = cmd_args.gdf
+    self.mock = cmd_args.mock
+    self.folder = cmd_args.folder
+    if self.folder != '' and self.folder[-1] != '/':
+        self.folder += '/' # add a trailing slash
+    self.tag = cmd_args.tag
+    self.sim_counter = self.last_sim = 0
+    self.get_git_info()
+    self.params = {'simParams': {}, 'bgParams': {}} # will be filled later
+
+  def get_git_info(self):
+    # Retrieve info on the code version (git commit ID and git status), to ensure reproducibility
+    # commit ID
+    try:
+      self.commit_id = subprocess.check_output(['git', 'rev-parse', 'HEAD'])
+      self.commit_id = 'git commit ID = ' + self.commit_id[0:-1]
+    except:
+      self.commit_id = 'git commit ID not available'
+    # git status
+    try:
+      self.status_line = subprocess.check_output(['git', 'status', '--porcelain', '-uno', '-z'])
+      self.status_line = self.status_line.replace('\0', ' - ')
+      if self.status_line == '':
+        self.status_line = 'All changes have been commited'
+      else:
+        self.status_line = 'Changes not yet commited in the following files: '+self.status_line
+    except:
+      self.status_line = 'Git status not available'
+
+  def load_file_config(self, name, filename = ''):
+
+    # Loads a .py file which specifies parameters
+    if filename == '':
+      filename = './'+name+'.py'
+    try:
+      custom_params = run_path(filename, init_globals=globals())
+      if name not in self.params.keys():
+        self.params[name] = {}
+      self.params[name].update(custom_params[name])
+    except:
+      raise ImportError('The parameters could not be loaded. Please make sure that the custom parameters are provided in a python file called `'+filename+'` defining the variable `'+name+'`.')
+
+  def load_cmdline_config(self, cmd_args):
+    # Loads the options from the commandline, overriding all previous parameterizations
+    self.params['simParams'].update({k: v for k, v in vars(cmd_args).items() if k in ['whichSim', 'nbcpu', 'nbnodes', 'nestSeed', 'pythonSeed', 'scalefactor'] if v != None})
+
+  def create_workspace(self, IDstring):
+    # Initialize the experiment-specific directory named with IDstring and populate it with the required files
+    print('Create subdirectory: '+IDstring)
+    os.system('mkdir -p '+IDstring+'/log')
+    os.system('cp ' + ' '.join(self.files_to_transfer) + ' ' + IDstring + '/')
+    os.system('mkdir -p '+IDstring+'/ctx')
+    # create a file to record the execution times inside '/log'
+    with open(IDstring+'/log/'+'performance.txt', 'w') as file:
+      file.write('Function_Name Time (s)'+'\n')
+    try:
+      os.system('cp ' + ' '.join(self.ctx_params) + ' ' + IDstring + '/ctx/')
+    except:
+      print('Could not transfer cortical npz probabilities -> continuing without.')
+    try:
+      os.system('cp ' + ' '.join(self.ctxM1_params) + ' ' + IDstring + '/ctx/')
+    except:
+      print('Could not transfer cortical M1 npz probabilities -> continuing without.')
+    os.system('mkdir -p '+IDstring+'/CBnetwork')
+    try:
+      os.system('cp ' + ' '.join(self.cb_params_nt) + ' ' + IDstring + '/CBnetwork/')
+    except:
+      print('Could not transfer CB probabilities -> continuing without.')
+    os.system('mkdir -p '+IDstring+'/CBneurons')
+    try:
+      os.system('cp ' + ' '.join(self.cb_params_nr) + ' ' + IDstring + '/CBneurons/')
+    except:
+      print('Could not transfer CB probabilities -> continuing without.')
+
+  def write_params(self, IDstring, params, name='simParams'):
+    # Write the experiment-specific parameterization file into a file called name+".py"
+    filename = './'+name+'.py'
+    print('Writing '+filename)
+    header = ['#!/usr/bin/env python \n\n',
+              '## This file was auto-generated by run.py called with the following arguments:\n',
+              '# '+' '.join(sys.argv)+'\n\n',
+              '## ID string of experiment:\n',
+              '# '+IDstring+'\n\n',
+              '## Reproducibility info:\n',
+              '#  platform = '+self.platform+'\n'
+              '#  '+self.commit_id+'\n',
+              '#  '+self.status_line+'\n\n',
+             ]
+    paramsFile = open(filename,'w')
+    paramsFile.writelines(header)
+    json_params = json.dumps(params, indent=4, separators=(',', ': '), sort_keys=True)
+    json_params = json_params.replace(': true',': True').replace(': false', ': False').replace(': null', ': None') # more robust would be to use json.loads()
+    paramsFile.writelines([name+' =\\\n'])
+    paramsFile.writelines(json_params)
+    paramsFile.close()
+
+  def launchOneParameterizedRun(self, counter, params):
+    # Generates the sub-directory and queue the run
+    # incremental naming scheme
+    IDstring = self.timeString+'_xp%06d' % (counter)
+    if self.folder != '':
+      IDstring = self.folder + IDstring # initialize the XP in another directory (optional)
+    if self.tag != '':
+      IDstring += '_'+self.tag # add the XP tag if present
+    # The first 3 steps initialize the directory and populate it with the configurations files
+    # 1: initialize the directory
+    self.create_workspace(IDstring)
+    os.chdir(IDstring)
+    # 2: write the simParams.py and bgParams.py files
+    #write ctx Params
+    self.write_params(IDstring, params['simParams'], 'simParams')
+    self.write_params(IDstring, params['bgParams'], 'bgParams')
+    self.write_params(IDstring, params['ctxParams'], 'ctxParams')
+    self.write_params(IDstring, params['ctxM1Params'], 'ctxM1Params')
+    self.write_params(IDstring, params['thParams'], 'thParams')
+    self.write_params(IDstring, params['connParams'], 'connParams')
+    # Then, specific actions are taken for different platforms
+    if self.platform == 'Local':
+      ##########################
+      # LOCAL SERIAL EXECUTION #
+      ##########################
+      # just launch the script
+      command = self.command+' '+params['simParams']['whichSim'] + '.py \n'
+    elif self.platform == 'LocalParallel':
+      ############################
+      # LOCAL PARALLEL EXECUTION #
+      ############################
+      # launch scripts in parallel until CPU is completely used, then finish them all and do it again
+      try:
+        import psutil
+      except:
+        print('Aborting: `psutil` could not be loaded but is required for local parallel execution (try `pip install psutil`)')
+        sys.exit(1)
+      if psutil.cpu_percent(interval=1) < 95.:
+        command = 'mpirun -n ' + str(params['simParams']['nbnodes'])+' '+ self.command+' '+params['simParams']['whichSim']+'.py \n'+' &'
+      else:
+        command = 'mpirun -n ' + str(params['simParams']['nbnodes'])+' ' + self.command+' '+params['simParams']['whichSim'] + '.py \n'
+    elif self.platform == 'Sango':
+      ###########################
+      # SANGO CLUSTER EXECUTION #
+      ###########################
+      sango_header = '#!/bin/bash\n\n'
+      # #SBATCH --mem-per-cpu=1G changed for #SBATCH --mem-per-cpu=200M
+      slurmOptions = ['#SBATCH --time=7-00:00:00 \n',
+                      '#SBATCH --partition=postproc1 \n',
+                      '#SBATCH --mem-per-cpu=4G \n',
+                      #'#SBATCH --mem=14g \n',
+                      '#SBATCH --ntasks='+str(params['simParams']['nbnodes'])+' \n',
+                      '#SBATCH --cpus-per-task='+str(params['simParams']['nbcpu'])+' \n',
+                      '#SBATCH --job-name=sBCBG_'+IDstring+'\n',
+                      '#SBATCH --input=none\n',
+                      '#SBATCH -e bg_job_e.out \n', 
+                      '#SBATCH --output=bg_job_o.out \n',
+                      #'#SBATCH --mail-type=BEGIN,END,FAIL \n',
+                      #'export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK} \n'
+                      ]
+      #moduleUse = ['module use /apps/unit/DoyaU/.modulefiles/ \n']
+      #moduleLoad = ['module load nest/2.12.0 \n']
+      #moduleLoad = ['module load nest/2.10 \n']  ## used for most of the screen
+      moduleLoad = ['module load gsl/2.0 \n',
+                    'module load openmpi.gcc/1.8.8 \n',
+                    #'module load nest_5g/5g \n',
+                    'module load python/3.5.2 \n',
+                    'source /apps/unit/DoyaU/nest-2.16-install/bin/nest_vars.sh \n',
+                    'echo \"path: \" $PATH \n',
+                    'echo \"pythonpath: \" $PYTHONPATH \n',
+                    'echo \"cores: \" $OMP_NUM_THREADS \n']
+      # write the script file
+      print('Write slurm script file')
+      script = open('go.slurm','w')
+      script.writelines(sango_header)
+      script.writelines(slurmOptions)
+      #script.writelines(moduleUse)
+      script.writelines(moduleLoad)
+      script.writelines('srun --mpi=pmi2 '+self.command+' '+params['simParams']['whichSim']+'.py \n')
+      script.close()
+      # execute the script file
+      command = 'sbatch go.slurm'
+    elif self.platform == 'K':
+      #######################
+      # K CLUSTER EXECUTION #
+      #######################
+      # Create file bg.sh
+      bg_lines = ['#!/bin/sh \n',
+                  'export HOME=\".\" \n',
+                  'export PATH=\"/opt/klocal/Python-3.5.5-fujitsu/bin:/opt/klocal/gsl-2.4-fujitsu/bin:${PATH}\" \n',
+                  'export LD_LIBRARY_PATH=\"/opt/klocal/Python-3.5.5-fujitsu/lib:/opt/klocal/cblas/lib:/opt/klocal/gsl-2.4-fujitsu/lib:${LD_LIBRARY_PATH}\" \n',
+                  'export NEST_DATA_DIR=\"../share/nest\" \n',
+                  'export PYTHONPATH=\"../lib/python3.5/site-packages\" \n',
+                  '. ../bin/nest_vars.sh \n',
+                  'mkdir ./log \n',
+                  'python3 '+params['simParams']['whichSim']+'.py \n',
+                  ]
+      script = open('bg.sh','w')
+      script.writelines(bg_lines)
+      script.close()
+      pjmOptions = ['#!/bin/bash -x \n',
+                    '#PJM -m b \n',
+                    '#PJM -m e \n',
+                    '#PJM --rsc-list \"rscgrp=large\" \n',   #change this depending the size of the simulation
+                    '#PJM --rsc-list \"node='+str(params['simParams']['nbnodes'])+'\" \n',
+                    '#PJM --rsc-list \"elapse=1:00:00\" \n',
+                    '#PJM --mpi \"proc='+str(params['simParams']['nbnodes'])+'\" \n',
+                    '#PJM -s \n',
+                    '#PJM --stg-transfiles all \n',
+                    '#PJM --mpi \"use-rankdir\" \n',
+                    '#PJM --stgin \"rank=* ./*.py %r:./\" \n',
+                    '#PJM --stgin \"rank=* ./bg.sh %r:./\" \n',
+                    '#PJM --stgin-dir \"rank=* ./CBnetwork %r:./CBnetwork recursive=2\" \n',
+                    '#PJM --stgin-dir \"rank=* ./CBneurons %r:./CBneurons recursive=2\" \n',
+                    '#PJM --stgin-dir \"rank=* ./ctx %r:./ctx recursive=2\" \n',
+                    '#PJM --stgin-dir \"rank=0 ../../../Application/nest216/nest_simulator_216_install/bin 0:../bin recursive=7\" \n',
+                    '#PJM --stgin-dir \"rank=0 ../../../Application/nest216/nest_simulator_216_install/lib 0:../lib recursive=7\" \n',
+                    '#PJM --stgin-dir \"rank=0 ../../../Application/nest216/nest_simulator_216_install/share 0:../share recursive=7\" \n',
+                    '#PJM --stgout \"rank=* %r:./log/* ./log/ stgout=all\" \n\n',
+                    '. /work/system/Env_base \n',
+                    'export FLIB_FASTOMP=FALSE \n',
+                    'mpirun -np '+str(params['simParams']['nbnodes'])+' sh bg.sh \n',
+                    'echo \"finish\"',
+                    ]
+      # write the script file
+      print('Write PJM script file')
+      script = open('my_job.sh','w')
+      script.writelines(pjmOptions)
+      script.close()
+      # execute the script file
+      command = 'pjsub ./my_job.sh'
+    # starting/queuing the simulation
+    elif self.platform == 'Hokusai':
+        #########################################
+        # Hokusai Big Waterfall CLUSTER EXECUTION #
+        #########################################
+        # Create file job.sh
+        hokusai_header = '#!/bin/sh \n\n'
+        HokusaiOptions = ['#PJM -L rscunit=bwmpc \n',
+                          '#PJM -L rscgrp=batch \n',
+                        #'#PJM -L "node=' + str(params['simParams']['nbnodes']) + '"\n',
+                        '#PJM -L "vnode=' + str(params['simParams']['nbnodes']) + '"\n',
+                        '#PJM -L "vnode-core=' + str(params['simParams']['nbcpu']) + '"\n',
+                        '#PJM -L elapse=86400 \n',
+                        '#PJM -s\n',
+                        '#PJM -g Q20487 \n',
+                        '#PJM -j \n',
+                        #'mpirun ' + 'python3' + ' ' + './' +params['simParams']['whichSim'] + '\n'
+                        'export OMP_NUM_THREADS = ' + str(int(params['simParams']['nbcpu'])) + '\n',
+                        'mpirun -np '+str(params['simParams']['nbnodes'])+' -ppn ' +str(1)+ ' ' + 'python3' + ' ' + './' + params['simParams']['whichSim'] + '.py \n'
+                        ]
+        # write the script file
+        print('Write PJM script file')
+        script = open('my_job.sh', 'w')
+        script.writelines(hokusai_header)
+        script.writelines(HokusaiOptions)
+        #script.writelines(self.command + ' ' + params['simParams']['whichSim'] + '.py \n')
+        script.close()
+        # execute the script file
+        command = 'pjsub ./my_job.sh'
+
+    elif self.platform == 'dcprg':
+        #########################################
+        # Hokusai Big Waterfall CLUSTER EXECUTION #
+        #########################################
+        # Create file job.sh
+        dcprg_hostfile = ['node01:24 \n',
+                          'node02:24 \n',
+                          'node03:24 \n',
+                          'node04:24 \n',
+                          'node05:24 \n',
+                          'node06:24 \n',
+                          'node07:24 \n',
+                          'node08:24 \n',
+                    ]
+        script = open('hostfile', 'w')
+        script.writelines(dcprg_hostfile)
+        script.close()
+
+        dcprg_header = '#!/bin/sh \n\n'
+        dcprgOptions = [
+                        #'mpirun ' + 'python3' + ' ' + './' +params['simParams']['whichSim'] + '\n'
+                        #'export OMP_NUM_THREADS = ' + str(int(params['simParams']['nbcpu'])) + '\n',
+                        'mpirun -np 8 -hostfile hostfile '+'python3' + ' ' + './' + params['simParams']['whichSim'] + '.py \n'
+                        #'mpirun -np '+str(params['simParams']['nbnodes'])+' -ppn ' +str(1)+ ' ' + 'python3' + ' ' + './' + params['simParams']['whichSim'] + '.py \n'
+                        ]
+        # write the script file
+        print('Write PJM script file')
+
+        script = open('my_job.sh', 'w')
+        script.writelines(dcprg_header)
+        script.writelines(dcprgOptions)
+        #script.writelines(self.command + ' ' + params['simParams']['whichSim'] + '.py \n')
+        script.close()
+        os.system('chmod 777 my_job.sh')
+        # execute the script file
+        command = './my_job.sh'
+    # starting/queuing the simulation
+    if command != '':
+      if self.mock == False:
+        # not a mock simulation
+        print('Executing: '+ command)
+        os.system(command)
+        print('done.')
+      else:
+        print('Mock simulation -- the command `'+command+'` was not executed')
+    # need to backtrack to the enclosing folder before launching next run
+    os.chdir('..')
+
+  def recParamExplo(self, simParams, otherParams):
+    ## commenting 12 lines below , temporal Fix, otherwise will run several simulations
+    '''
+    # Performs the recursive exploration of parameters values
+    try:
+      # get the first index of list item (fails with error)
+      idx = [isinstance(simParams[entry], list) for entry in simParams].index(True)
+      # iterate through the array values
+      paramK = simParams.keys()[idx]
+      calldict = simParams.copy()
+      del calldict[paramK]
+      for v in simParams[paramK]:
+        calldict[paramK]=v
+        self.recParamExplo(calldict, otherParams)
+    except:
+    '''
+    if True:  
+      variedParams = {'simParams': simParams}
+      for anotherParams in otherParams.keys():
+        variedParams[anotherParams] = otherParams[anotherParams]
+      self.launchOneParameterizedRun(self.sim_counter, variedParams)
+      self.sim_counter += 1
+
+  def computesSimNb(self):
+    # computes the total number of simulations
+    # including variations in 'simParams'
+    sim_nb = 1
+    # Commenting 4 lines below (otherwise 2 simulations will be created !!!)
+    #for param_key in self.params['simParams'].keys():
+    #  param_vals = self.params['simParams'][param_key]
+    #  if isinstance(param_vals, list):
+    #    sim_nb *= len(param_vals)
+    return sim_nb
+
+  def expandValues(self):
+    # Sugar to get automagically the number of CPUs when nbcpu = -1
+    if self.params['simParams']['nbcpu'] < 0:
+      self.params['simParams']['nbcpu'] = multiprocessing.cpu_count()
+      print('Using guessed number of CPUs: '+str(self.params['simParams']['nbcpu']))
+
+  def dispatch(self):
+    # Loads the configurations and launch the runs
+    self.load_file_config('simParams', './baseSimParams.py')
+    self.load_file_config('bgParams', './baseBGParams.py')
+    self.load_file_config('ctxParams', './baseCTXParams.py')
+    self.load_file_config('ctxM1Params', './baseCTXM1Params.py')
+    self.load_file_config('thParams', './baseTHParams.py')
+    self.load_file_config('connParams', './baseCONNParams.py')
+    if self.cmd_args.customSim != None:
+      self.load_file_config('simParams', self.cmd_args.customSim)
+    if self.cmd_args.customBG != None:
+      self.load_file_config('bgParams', self.cmd_args.customBG)
+    if self.cmd_args.customCTX != None:
+      self.load_file_config('ctxM1Params', self.cmd_args.customCTX)
+    if self.cmd_args.customCTX != None:
+      self.load_file_config('ctxParams', self.cmd_args.customCTX)
+    if self.cmd_args.customTH != None:
+      self.load_file_config('thParams', self.cmd_args.customTH)
+    if self.cmd_args.customCONN != None:
+      self.load_file_config('connParams', self.cmd_args.customCONN)
+    self.load_cmdline_config(self.cmd_args)
+    # replace values to be set at runtime (for now, only used when "nbcpu=-1")
+    self.expandValues()
+    # computes the total number of simulations
+    sim_nb = self.computesSimNb()
+    if sim_nb != 1:
+      print('Will launch '+str(sim_nb)+' simulations. Buckle up!\n')
+    # initialize the file list to transfer
+    self.files_to_transfer = ['nest_routine.py', 'ini_all.py', 'fetch_params.py', self.params['simParams']['whichSim']+'.py', 'wbnao.py', 'build_it.py', '__init__.py'] # 'nstrand.py'
+    #self.ctx_params = ['ctx/' + npz_file for npz_file in['vS1_Neuron_pos_L1.npz', 'vS1_Neuron_pos_L2.npz', 'vS1_Neuron_pos_L3.npz','vS1_Neuron_pos_L4.npz', 'vS1_Neuron_pos_L5A.npz', 'vS1_Neuron_pos_L5B.npz','vS1_Neuron_pos_L6.npz', 'S1_internal_connection.pickle']]
+    self.ctx_params = ['ctx/' + npz_file for npz_file in ['S1_internal_connection.json']]
+    # self.ctxM1_params = ['ctx/' + npz_file for npz_file in ['M1_internal_connection.pickle']]
+    self.ctxM1_params = ['ctx/' + npz_file for npz_file in ['M1_internal_connection.json']]
+    self.cb_params_nt = ['CBnetwork/'+ py_file for py_file in ['__init__.py', 'network_bs.py', 'network_go.py', 'network_gr.py', 'network_io.py', 'network_mf.py', 'network_pkj.py', 'network_vn.py', 'network_pons.py']]
+    self.cb_params_nr = ['CBneurons/'+ py_file for py_file in ['__init__.py', 'bs.py', 'go.py','gr.py', 'io.py', 'mf.py', 'pkj.py', 'spike_detector.py', 'vn.py', 'pons.py']]
+    # performs the recurrent exploration of parameterizations to run
+    self.recParamExplo(self.params['simParams'], {anotherParams: self.params[anotherParams] for anotherParams in self.params.keys() if anotherParams != 'simParams'})
+
+def main():
+    # Parse the commandline arguments
+    parser = argparse.ArgumentParser(description="Simulation Dispatcher. Argument precedence: Hardcoded default values < Custom initialization file values < commandline-supplied values.", formatter_class=lambda prog: argparse.HelpFormatter(prog,max_help_position=27))
+    parser._action_groups.pop()
+    RequiredNamed = parser.add_argument_group('mandatory arguments')
+    RequiredNamed.add_argument('--platform', type=str, help='Run the experiment on which platform?', required=True, choices=['Local', 'LocalParallel', 'Sango','dcprg', 'K', 'Hokusai'])
+    Optional = parser.add_argument_group('optional arguments')
+    Optional.add_argument('--python', type=str, help='Python version', default='3')
+    Optional.add_argument('--customSim', type=str, help='Provide a custom file to initialize simulation parameters', default=None)
+    Optional.add_argument('--customBG', type=str, help='Provide a custom file to initialize basal ganglia parameters', default=None)
+    Optional.add_argument('--customCTX', type=str, help='Provide a custom file to initialize cortex parameters', default=None)
+    Optional.add_argument('--customTH', type=str, help='Provide a custom file to initialize TH parameters',default=None)
+    Optional.add_argument('--customCONN', type=str, help='Provide a custom file to initialize CONN parameters',default=None)
+    Optional.add_argument('--whichSim', type=str, help='Which simulation to run? [`main_sim` by default]', choices=['main_sim', 'stim_sim', 'sim_s1','sim_M1', 'sim_S1_M1','stim_sim_as', 'stim_sim_mas', 'sim_cb', 'stim_all_model', 'robobrain_task_1'], default='main_sim.py')
+    Optional.add_argument('--nbcpu', type=int, help='Number of CPU to use (-1 to guess)', default=None)
+    Optional.add_argument('--nbnodes', type=int, help='Number of nodes to use on K cluster', default=None)
+    Optional.add_argument('--gdf', action="store_true", help='Set to store spike rasters (gdf files) of the simulation', default=False)
+    Optional.add_argument('--tag', type=str, help='optional tag for this experiment, to be added to the directory name (avoid special characters like "/" or "\\")', default='')
+    Optional.add_argument('--nestSeed', type=int, help='Nest seed (affects the Poisson spike train generator)', default=None)
+    Optional.add_argument('--pythonSeed', type=int, help='Python seed (affects connection map)', default=None)
+    Optional.add_argument('--mock', action="store_true", help='Does not start the simulation, only writes experiment-specific directories', default=False)
+    Optional.add_argument('--folder', type=str, help='Initialize and run the simulation in this directory (current directory if not specified)', default='')
+    Optional.add_argument('--scalefactor', nargs='+', type=float, help='Initialize and run the simulation with this scale factor', default=None)
+    
+    cmd_args = parser.parse_args()
+    
+    dispatcher = JobDispatcher(cmd_args)
+
+    dispatcher.dispatch()
+
+if __name__ == '__main__':
+    main()
+
+
