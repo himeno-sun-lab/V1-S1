@@ -1,0 +1,16 @@
+name: nest3.8
+channels:
+  - conda-forge
+dependencies:
+  - ipykernel
+  - matplotlib
+  - nest-simulator
+  - numpy
+  - plotly
+  - python==3.12
+  - scikit-learn
+  - scipy
+  - pip:
+    - snakemake==9.4.0
+
+prefix: "/Users/nozomizore1974/.local/share/mamba/envs/nest3.8"
