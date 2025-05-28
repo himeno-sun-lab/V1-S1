@@ -23,14 +23,14 @@ import os
 def main():
   # 1) reads parameters
   sim_params = fetch_params.read_sim()
-  ctx_params = fetch_params.read_ctx()
+  ctx_M1_params = fetch_params.read_ctx()
 
   # 1.5) initialize nest
   nest_routine.initialize_nest(sim_params)
 
   # 2) instantiates regions
   start_time = time.time()
-  ctx_layers = ini_all.instantiate_ctx(ctx_params, sim_params['scalefactor'], sim_params['initial_ignore'], 'S1')
+  ctx_layers = ini_all.instantiate_ctx(ctx_M1_params, sim_params['scalefactor'], sim_params['initial_ignore'], 'M1')
   with open('./log/'+'performance.txt', 'a') as file:
     file.write('S1_Construction_Time '+str(time.time()-start_time)+'\n')
 
